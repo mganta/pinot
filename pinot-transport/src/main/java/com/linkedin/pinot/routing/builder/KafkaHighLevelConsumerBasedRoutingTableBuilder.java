@@ -54,6 +54,10 @@ public class KafkaHighLevelConsumerBasedRoutingTableBuilder implements RoutingTa
           continue;
         }
 
+        // Skip segments that are not high level consumer segments
+        if (!SegmentNameBuilder.Realtime.isHighLevelRealtimeSegmentName(segment))
+          continue;
+
         String groupId = SegmentNameBuilder.Realtime.extractGroupIdName(segment);
         if (!groupIdToRouting.containsKey(groupId)) {
           groupIdToRouting.put(groupId, new HashMap<String, Set<String>>());
