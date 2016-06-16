@@ -16,17 +16,36 @@
 
 package com.linkedin.pinot.routing.builder;
 
+import com.linkedin.pinot.common.utils.CommonConstants;
+import com.linkedin.pinot.common.utils.SegmentNameBuilder;
 import com.linkedin.pinot.routing.ServerToSegmentSetMap;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Random;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import org.apache.commons.configuration.Configuration;
+import org.apache.commons.lang3.tuple.ImmutablePair;
+import org.apache.commons.lang3.tuple.Pair;
 import org.apache.helix.model.ExternalView;
 import org.apache.helix.model.InstanceConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
 /**
  * Routing table builder for the Kafka low level consumer.
  */
 public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBuilder {
+  private static final Logger LOGGER = LoggerFactory.getLogger(KafkaLowLevelConsumerRoutingTableBuilder.class);
+  private static final int routingTableCount = 10;
+
   @Override
   public void init(Configuration configuration) {
     // No configuration at the moment
@@ -74,21 +93,190 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
     // 2.112, 1.496 and 0.853.
     //
     // This algorithm works as follows:
-    // 1. Gather all segments and group them by Kafka partition
+    // 1. Gather all segments and group them by Kafka partition, sorted by sequence number
     // 2. Ensure that for each partition, we have at most one partition in consuming state
     // 3. Sort all the segments to be used during assignment in ascending order of replicas
     // 4. For each segment to be used during assignment, pick a random replica, weighted by the number of segments
     //    assigned to each replica.
 
-    // 1. Gather all segments and group them by Kafka partition
+    // 1. Gather all segments and group them by Kafka partition, sorted by sequence number
+    Map<String, SortedSet<String>> sortedSegmentsByKafkaPartition = new HashMap<String, SortedSet<String>>();
+    for (String helixPartitionName : externalView.getPartitionSet()) {
+      // Ignore segments that are not low level consumer segments
+      if (!SegmentNameBuilder.Realtime.isRealtimeV2Name(helixPartitionName)) {
+        continue;
+      }
+
+      String kafkaPartitionName = SegmentNameBuilder.Realtime.extractPartitionRange(helixPartitionName);
+      SortedSet<String> segmentsForPartition = sortedSegmentsByKafkaPartition.get(kafkaPartitionName);
+
+      // Create sorted set if necessary
+      if (segmentsForPartition == null) {
+        segmentsForPartition = new TreeSet<String>(new Comparator<String>() {
+          @Override
+          public int compare(String firstSegment, String secondSegment) {
+            // Sort based on sequence number, falling back on string comparison in case there is an exception
+            try {
+              int firstSegmentSequenceNumber =
+                  Integer.parseInt(SegmentNameBuilder.Realtime.extractSequenceNumber(firstSegment));
+              int secondSegmentSequenceNumber =
+                  Integer.parseInt(SegmentNameBuilder.Realtime.extractSequenceNumber(secondSegment));
+              return Integer.compare(firstSegmentSequenceNumber, secondSegmentSequenceNumber);
+            } catch (NumberFormatException e) {
+              LOGGER.warn("Caught number format exception while comparing segments {} and {}", firstSegment,
+                  secondSegment, e);
+              return firstSegment.compareTo(secondSegment);
+            }
+          }
+        });
+
+        sortedSegmentsByKafkaPartition.put(kafkaPartitionName, segmentsForPartition);
+      }
+
+      segmentsForPartition.add(helixPartitionName);
+    }
 
     // 2. Ensure that for each partition, we have at most one partition in consuming state
+    Map<String, String> lastSegmentInConsumingStateByKafkaPartition = new HashMap<String, String>();
+    for (String kafkaPartition : sortedSegmentsByKafkaPartition.keySet()) {
+      SortedSet<String> sortedSegmentsForKafkaPartition = sortedSegmentsByKafkaPartition.get(kafkaPartition);
+      String lastSegment = sortedSegmentsForKafkaPartition.last();
+
+      // Only keep the segment if all replicas have it in CONSUMING state
+      Map<String, String> helixPartitionState = externalView.getStateMap(lastSegment);
+      for (String externalViewState : helixPartitionState.values()) {
+        // Ignore ERROR state
+        if (externalViewState.equalsIgnoreCase(
+            CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.ERROR)) {
+          continue;
+        }
+
+        // Not all segments are in CONSUMING state, therefore don't consider the last segment assignable to CONSUMING
+        // replicas
+        if (externalViewState.equalsIgnoreCase(
+            CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.ONLINE)) {
+          lastSegment = null;
+          break;
+        }
+      }
+
+      if (lastSegment != null) {
+        lastSegmentInConsumingStateByKafkaPartition.put(kafkaPartition, lastSegment);
+      }
+    }
 
     // 3. Sort all the segments to be used during assignment in ascending order of replicas
+    PriorityQueue<Pair<String, Set<String>>> segmentToReplicaSetQueue = new PriorityQueue<Pair<String, Set<String>>>(
+        new Comparator<Pair<String, Set<String>>>() {
+          @Override
+          public int compare(Pair<String, Set<String>> firstPair, Pair<String, Set<String>> secondPair) {
+            return Integer.compare(firstPair.getRight().size(), secondPair.getRight().size());
+          }
+        });
+
+    for (Map.Entry<String, SortedSet<String>> entry : sortedSegmentsByKafkaPartition.entrySet()) {
+      String kafkaPartition = entry.getKey();
+      SortedSet<String> segments = entry.getValue();
+
+      // The only segment name which is allowed to be in CONSUMING state or null
+      String validConsumingSegment = lastSegmentInConsumingStateByKafkaPartition.get(kafkaPartition);
+
+      for (String segment : segments) {
+        Set<String> validReplicas = new HashSet<String>();
+        Map<String, String> externalViewState = externalView.getStateMap(segment);
+
+        for (Map.Entry<String, String> instanceAndStateEntry : externalViewState.entrySet()) {
+          String instance = instanceAndStateEntry.getKey();
+          String state = instanceAndStateEntry.getValue();
+
+          // Replicas in ONLINE state are always allowed
+          if (state.equalsIgnoreCase(CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.ONLINE)) {
+            validReplicas.add(instance);
+            continue;
+          }
+
+          // Replicas in CONSUMING state are only allowed on the last segment
+          if (state.equalsIgnoreCase(CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.CONSUMING)
+              && segment.equals(validConsumingSegment)) {
+            validReplicas.add(instance);
+          }
+        }
+
+        segmentToReplicaSetQueue.add(new ImmutablePair<String, Set<String>>(segment, validReplicas));
+      }
+    }
 
     // 4. For each segment to be used during assignment, pick a random replica, weighted by the number of segments
     //    assigned to each replica.
+    List<ServerToSegmentSetMap> routingTables = new ArrayList<ServerToSegmentSetMap>(routingTableCount);
+    for(int i = 0; i < routingTableCount; ++i) {
+      Map<String, Set<String>> instanceToSegmentSetMap = new HashMap<String, Set<String>>();
+      while (!segmentToReplicaSetQueue.isEmpty()) {
+        Pair<String, Set<String>> segmentAndValidReplicaSet = segmentToReplicaSetQueue.poll();
+        String segment = segmentAndValidReplicaSet.getKey();
+        Set<String> validReplicaSet = segmentAndValidReplicaSet.getValue();
 
-    return null;
+        String replica = pickWeightedRandomReplica(validReplicaSet, instanceToSegmentSetMap);
+        if (replica != null) {
+          instanceToSegmentSetMap.get(replica).add(segment);
+        }
+      }
+    }
+
+    return routingTables;
+  }
+
+  private String pickWeightedRandomReplica(Set<String> validReplicaSet,
+      Map<String, Set<String>> instanceToSegmentSetMap) {
+    Random random = new Random();
+
+    // No replicas?
+    if (validReplicaSet.isEmpty()) {
+      return null;
+    }
+
+    // Only one valid replica?
+    if (validReplicaSet.size() == 1) {
+      return validReplicaSet.iterator().next();
+    }
+
+    // Find maximum segment count assigned to a replica
+    String[] replicas = validReplicaSet.toArray(new String[validReplicaSet.size()]);
+    int[] replicaSegmentCounts = new int[validReplicaSet.size()];
+
+    int maxSegmentCount = 0;
+    for (int i = 0; i < replicas.length; i++) {
+      String replica = replicas[i];
+      int replicaSegmentCount = instanceToSegmentSetMap.get(replica).size();
+      replicaSegmentCounts[i] = replicaSegmentCount;
+
+      if (maxSegmentCount < replicaSegmentCount) {
+        maxSegmentCount = replicaSegmentCount;
+      }
+    }
+
+    // Compute replica weights
+    int[] replicaWeights = new int[validReplicaSet.size()];
+    int totalReplicaWeights = 0;
+    for (int i = 0; i < replicas.length; i++) {
+      int replicaWeight = maxSegmentCount - replicaSegmentCounts[i];
+      replicaWeights[i] = replicaWeight;
+      totalReplicaWeights += replicaWeight;
+    }
+
+    // If all replicas are equal, just pick a random replica
+    if (totalReplicaWeights == 0) {
+      return replicas[random.nextInt(replicas.length)];
+    }
+
+    // Pick the proper replica given their respective weights
+    int randomValue = random.nextInt(totalReplicaWeights);
+    int i = 0;
+    while(replicaWeights[i] == 0 || replicaWeights[i] <= randomValue) {
+      randomValue -= replicaWeights[i];
+      ++i;
+    }
+
+    return replicas[i];
   }
 }
