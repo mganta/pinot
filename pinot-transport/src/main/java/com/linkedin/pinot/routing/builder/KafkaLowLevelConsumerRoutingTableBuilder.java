@@ -167,6 +167,7 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
 
     // 3. Sort all the segments to be used during assignment in ascending order of replicas
     PriorityQueue<Pair<String, Set<String>>> segmentToReplicaSetQueue = new PriorityQueue<Pair<String, Set<String>>>(
+        externalView.getPartitionSet().size(),
         new Comparator<Pair<String, Set<String>>>() {
           @Override
           public int compare(Pair<String, Set<String>> firstPair, Pair<String, Set<String>> secondPair) {
