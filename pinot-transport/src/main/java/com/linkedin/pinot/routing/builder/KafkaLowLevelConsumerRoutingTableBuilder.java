@@ -173,6 +173,7 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
             return Integer.compare(firstPair.getRight().size(), secondPair.getRight().size());
           }
         });
+    RoutingTableInstancePruner instancePruner = new RoutingTableInstancePruner(instanceConfigList);
 
     for (Map.Entry<String, SortedSet<String>> entry : sortedSegmentsByKafkaPartition.entrySet()) {
       String kafkaPartition = entry.getKey();
@@ -188,6 +189,11 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
         for (Map.Entry<String, String> instanceAndStateEntry : externalViewState.entrySet()) {
           String instance = instanceAndStateEntry.getKey();
           String state = instanceAndStateEntry.getValue();
+
+          // Skip pruned replicas (shutting down or otherwise disabled)
+          if (instancePruner.isInactive(instance)) {
+            continue;
+          }
 
           // Replicas in ONLINE state are always allowed
           if (state.equalsIgnoreCase(CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.ONLINE)) {
@@ -211,16 +217,29 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
     List<ServerToSegmentSetMap> routingTables = new ArrayList<ServerToSegmentSetMap>(routingTableCount);
     for(int i = 0; i < routingTableCount; ++i) {
       Map<String, Set<String>> instanceToSegmentSetMap = new HashMap<String, Set<String>>();
-      while (!segmentToReplicaSetQueue.isEmpty()) {
-        Pair<String, Set<String>> segmentAndValidReplicaSet = segmentToReplicaSetQueue.poll();
+
+      PriorityQueue<Pair<String, Set<String>>> segmentToReplicaSetQueueCopy =
+          new PriorityQueue<Pair<String, Set<String>>>(segmentToReplicaSetQueue);
+
+      while (!segmentToReplicaSetQueueCopy.isEmpty()) {
+        Pair<String, Set<String>> segmentAndValidReplicaSet = segmentToReplicaSetQueueCopy.poll();
         String segment = segmentAndValidReplicaSet.getKey();
         Set<String> validReplicaSet = segmentAndValidReplicaSet.getValue();
 
         String replica = pickWeightedRandomReplica(validReplicaSet, instanceToSegmentSetMap);
         if (replica != null) {
-          instanceToSegmentSetMap.get(replica).add(segment);
+          Set<String> segmentsForInstance = instanceToSegmentSetMap.get(replica);
+
+          if (segmentsForInstance == null) {
+            segmentsForInstance = new HashSet<String>();
+            instanceToSegmentSetMap.put(replica, segmentsForInstance);
+          }
+
+          segmentsForInstance.add(segment);
         }
       }
+
+      routingTables.add(new ServerToSegmentSetMap(instanceToSegmentSetMap));
     }
 
     return routingTables;
