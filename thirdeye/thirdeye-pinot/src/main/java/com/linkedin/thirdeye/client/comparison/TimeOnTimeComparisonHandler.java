@@ -26,8 +26,6 @@ import com.linkedin.thirdeye.client.comparison.Row.Metric;
 import com.linkedin.thirdeye.dashboard.Utils;
 
 public class TimeOnTimeComparisonHandler {
-  private static final String CURRENT = "current";
-  private static final String BASELINE = "baseline";
   private final QueryCache queryCache;
 
   public TimeOnTimeComparisonHandler(QueryCache queryCache) {
@@ -42,27 +40,17 @@ public class TimeOnTimeComparisonHandler {
     List<Range<DateTime>> currentTimeranges = new ArrayList<>();
     TimeGranularity aggregationTimeGranularity = comparisonRequest.getAggregationTimeGranularity();
     // baseline time ranges
-    DateTime baselineStart = comparisonRequest.getBaselineStart();
-    DateTime baselineEnd = comparisonRequest.getBaselineEnd();
-    baselineTimeranges =
-        TimeRangeUtils.computeTimeRanges(aggregationTimeGranularity, baselineStart, baselineEnd);
+    baselineTimeranges = TimeRangeUtils.computeTimeRanges(aggregationTimeGranularity,
+        comparisonRequest.getBaselineStart(), comparisonRequest.getBaselineEnd());
     // current time ranges
-    DateTime currentStart = comparisonRequest.getCurrentStart();
-    DateTime currentEnd = comparisonRequest.getCurrentEnd();
-    if (comparisonRequest.isEndDateInclusive()) {
-      // ThirdEyeRequest is exclusive endpoint, so increment by one bucket
-      long aggTimeBucketMillis = aggregationTimeGranularity.toMillis();
-      currentEnd = currentEnd.plus(aggTimeBucketMillis);
-      baselineEnd = baselineEnd.plus(aggTimeBucketMillis);
-    }
-    currentTimeranges =
-        TimeRangeUtils.computeTimeRanges(aggregationTimeGranularity, currentStart, currentEnd);
+    currentTimeranges = TimeRangeUtils.computeTimeRanges(aggregationTimeGranularity,
+        comparisonRequest.getCurrentStart(), comparisonRequest.getCurrentEnd());
     // create baseline request
-    ThirdEyeRequest baselineRequest =
-        createThirdEyeRequest(BASELINE, comparisonRequest, baselineStart, baselineEnd);
+    ThirdEyeRequest baselineRequest = createThirdEyeRequest("baseline", comparisonRequest,
+        comparisonRequest.getBaselineStart(), comparisonRequest.getBaselineEnd());
     // create current request
-    ThirdEyeRequest currentRequest =
-        createThirdEyeRequest(CURRENT, comparisonRequest, currentStart, currentEnd);
+    ThirdEyeRequest currentRequest = createThirdEyeRequest("current", comparisonRequest,
+        comparisonRequest.getCurrentStart(), comparisonRequest.getCurrentEnd());
 
     List<ThirdEyeRequest> requests = new ArrayList<>();
     requests.add(baselineRequest);
@@ -75,9 +63,9 @@ public class TimeOnTimeComparisonHandler {
       ThirdEyeRequest request = entry.getKey();
       Future<ThirdEyeResponse> responseFuture = entry.getValue();
       ThirdEyeResponse response = responseFuture.get(60, TimeUnit.SECONDS);
-      if (BASELINE.equals(request.getRequestReference())) {
+      if ("baseline".equals(request.getRequestReference())) {
         baselineResponse = response;
-      } else if (CURRENT.equals(request.getRequestReference())) {
+      } else if ("current".equals(request.getRequestReference())) {
         currentResponse = response;
       }
     }
@@ -135,9 +123,8 @@ public class TimeOnTimeComparisonHandler {
             currentMetricBaselineValue = 0;
           }
 
-          row.getMetrics().add(
-              new Metric(expression.getExpressionName(), derivedMetricBaselineValue,
-                  currentMetricBaselineValue));
+          row.getMetrics().add(new Metric(expression.getExpressionName(),
+              derivedMetricBaselineValue, currentMetricBaselineValue));
         }
       }
     }

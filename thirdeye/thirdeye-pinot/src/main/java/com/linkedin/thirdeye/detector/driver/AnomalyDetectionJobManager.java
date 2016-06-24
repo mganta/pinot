@@ -6,9 +6,11 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 
 import org.hibernate.SessionFactory;
 import org.joda.time.DateTime;
+import org.joda.time.format.ISODateTimeFormat;
 import org.quartz.CronScheduleBuilder;
 import org.quartz.CronTrigger;
 import org.quartz.JobBuilder;
@@ -24,20 +26,21 @@ import org.slf4j.LoggerFactory;
 import com.codahale.metrics.MetricRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.linkedin.thirdeye.api.TimeGranularity;
 import com.linkedin.thirdeye.client.timeseries.TimeSeriesHandler;
 import com.linkedin.thirdeye.client.timeseries.TimeSeriesResponseConverter;
 import com.linkedin.thirdeye.detector.api.AnomalyFunctionSpec;
 import com.linkedin.thirdeye.detector.db.AnomalyFunctionRelationDAO;
 import com.linkedin.thirdeye.detector.db.AnomalyFunctionSpecDAO;
 import com.linkedin.thirdeye.detector.db.AnomalyResultDAO;
-import com.linkedin.thirdeye.detector.driver.TestAnomalyApplication.TestType;
 import com.linkedin.thirdeye.detector.function.AnomalyFunction;
 import com.linkedin.thirdeye.detector.function.AnomalyFunctionFactory;
+import com.linkedin.thirdeye.detector.lib.util.JobUtils;
 
 public class AnomalyDetectionJobManager {
+  public static final String MONITORING_WINDOW_KEY = "monitoringWindow";
   private static final Logger LOG = LoggerFactory.getLogger(AnomalyDetectionJobManager.class);
   private final Scheduler quartzScheduler;
-  // private final ThirdEyeClient thirdEyeClient;
   private final TimeSeriesHandler timeSeriesHandler;
   private final TimeSeriesResponseConverter timeSeriesResponseConverter;
   private final AnomalyFunctionSpecDAO specDAO;
@@ -89,10 +92,14 @@ public class AnomalyDetectionJobManager {
       }
       AnomalyFunction anomalyFunction = anomalyFunctionFactory.fromSpec(spec);
 
-      String triggerKey = String.format("ad_hoc_anomaly_function_trigger_%d", spec.getId());
+      String triggerKey =
+          String.format("ad_hoc_anomaly_function_trigger_%d_%s-%s", spec.getId(),
+              windowStartIsoString, windowEndIsoString);
       Trigger trigger = TriggerBuilder.newTrigger().withIdentity(triggerKey).startNow().build();
 
-      String jobKey = String.format("ad_hoc_anomaly_function_job_%d", spec.getId());
+      String jobKey =
+          String.format("ad_hoc_anomaly_function_job_%d_%s-%s", spec.getId(), windowStartIsoString,
+              windowEndIsoString);
       buildAndScheduleJob(jobKey, trigger, anomalyFunction, spec, windowStartIsoString,
           windowEndIsoString);
     }
@@ -199,33 +206,67 @@ public class AnomalyDetectionJobManager {
         windowEndIsoString);
   }
 
-  public static void main(String[] args) throws Exception {
-    if (args.length != 2 && args.length != 4) {
-      System.err
-          .println("Arguments must be configYml functionSpecPath [startISO endISO, both hour aligned]");
-      System.exit(1);
+  public void simulatePeriod(Long id, String startIsoString, String endIsoString) throws Exception {
+    // TODO error checks
+    AnomalyFunctionSpec spec = specDAO.findById(id);
+    if (spec == null) {
+      throw new IllegalArgumentException("No function with id " + id);
     }
-    String thirdEyeConfigDir = args[0];
-    System.setProperty("dw.rootDir", thirdEyeConfigDir);
-    String detectorApplicationConfigFile = thirdEyeConfigDir + "/" + "detector.yml";
-    String filePath = args[1];
-    String startISO = null;
-    String endISO = null;
-    if (args.length == 4) {
-      startISO = args[2];
-      endISO = args[3];
+    AnomalyFunction anomalyFunction = anomalyFunctionFactory.fromSpec(spec);
+
+    DateTime startTime = ISODateTimeFormat.dateTimeParser().parseDateTime(startIsoString);
+    DateTime endTime = ISODateTimeFormat.dateTimeParser().parseDateTime(endIsoString);
+
+    long dataWindowMillis =
+        new TimeGranularity(spec.getWindowSize(), spec.getWindowUnit()).toMillis();
+    long monitorWindowMillis = getMonitoringWindowGranularity(spec).toMillis();
+    int numBuckets =
+        (int) Math.ceil((double) (endTime.getMillis() - startTime.getMillis())
+            / monitorWindowMillis);
+    LOG.info("Found {} windows for function {} from {} to {}, with monitoring window of {} ms",
+        numBuckets, id, startTime, endTime, monitorWindowMillis);
+    DateTime currentMonitoringWindowStart;
+    DateTime currentMonitoringWindowEnd = startTime.plus(monitorWindowMillis);
+
+    String functionName = spec.getFunctionName();
+    while (currentMonitoringWindowEnd.isBefore(endTime)
+        || currentMonitoringWindowEnd.isEqual(endTime)) {
+      currentMonitoringWindowStart = currentMonitoringWindowEnd.minus(dataWindowMillis);
+      LOG.info("Running {} with monitoring window: {} to {}", id, currentMonitoringWindowStart,
+          currentMonitoringWindowEnd);
+      try {
+        String triggerKey =
+            String.format("simulate_period_anomaly_function_trigger_%d_%s-%s", spec.getId(),
+                currentMonitoringWindowStart, currentMonitoringWindowEnd);
+        Trigger trigger = TriggerBuilder.newTrigger().withIdentity(triggerKey).startNow().build();
+
+        String jobKey =
+            String.format("simulate_period_anomaly_function_job_%d_%s-%s", spec.getId(),
+                currentMonitoringWindowStart, currentMonitoringWindowEnd);
+        buildAndScheduleJob(jobKey, trigger, anomalyFunction, spec,
+            currentMonitoringWindowStart.toString(), currentMonitoringWindowEnd.toString());
+      } catch (Exception e) {
+        LOG.error("Error encountered for {}, {}, {}:\n {}", id, currentMonitoringWindowStart,
+            currentMonitoringWindowEnd, e);
+      }
+      currentMonitoringWindowEnd = currentMonitoringWindowEnd.plus(monitorWindowMillis);
+    }
+    if (!currentMonitoringWindowEnd.equals(endTime)) {
+      LOG.error("Time windows did not line up with monitoring window!: {}, {}",
+          currentMonitoringWindowEnd, endTime);
+    }
+  }
+
+  private TimeGranularity getMonitoringWindowGranularity(AnomalyFunctionSpec spec) {
+    Properties props = JobUtils.decodeCompactedProperties(spec.getProperties());
+    // if specified in props, adjust start as needed.
+    int monitoringWindowSize = Integer.parseInt(props.getProperty(MONITORING_WINDOW_KEY, "-1"));
+    if (monitoringWindowSize > 0) {
+      return new TimeGranularity(monitoringWindowSize * spec.getBucketSize(), spec.getBucketUnit());
     } else {
-      DateTime now = DateTime.now().minusHours(3); // data delay.
-      startISO = now.minusDays(7) // subtract 7 days to set up w/w comparison
-          .minusHours(4) // subtract hours to specify what the length of the comparison window is
-          .toString();
-      endISO = now.toString();
+      // otherwise use full window
+      return new TimeGranularity(spec.getWindowSize(), spec.getWindowUnit());
     }
-    int existingFunctionId = 1;
-    new TestAnomalyApplication(filePath, startISO, endISO, TestType.FUNCTION, existingFunctionId)
-        .run(new String[] {
-            "server", detectorApplicationConfigFile
-        });
   }
 
 }
