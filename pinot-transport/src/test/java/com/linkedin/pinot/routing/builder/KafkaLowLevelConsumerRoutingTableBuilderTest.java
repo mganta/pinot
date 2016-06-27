@@ -16,6 +16,7 @@
 package com.linkedin.pinot.routing.builder;
 
 import com.linkedin.pinot.common.utils.CommonConstants;
+import com.linkedin.pinot.common.utils.LLCSegmentName;
 import com.linkedin.pinot.common.utils.SegmentNameBuilder;
 import com.linkedin.pinot.routing.ServerToSegmentSetMap;
 import java.util.ArrayList;
@@ -39,7 +40,7 @@ public class KafkaLowLevelConsumerRoutingTableBuilderTest {
   private static final Logger LOGGER = LoggerFactory.getLogger(KafkaLowLevelConsumerRoutingTableBuilderTest.class);
 
   @Test
-  public void testRoutingTable() {
+  public void testAllOnlineRoutingTable() {
     final int ITERATIONS = 1000;
     Random random = new Random();
 
@@ -51,6 +52,7 @@ public class KafkaLowLevelConsumerRoutingTableBuilderTest {
     for (int i = 0; i < ITERATIONS; i++) {
       int instanceCount = random.nextInt(12) + 3; // 3 to 14 instances
       int partitionCount = random.nextInt(8) + 4; // 4 to 11 partitions
+      int replicationFactor = random.nextInt(3) + 3; // 3 to 5 replicas
 
       // Generate instances
       String[] instanceNames = new String[instanceCount];
@@ -62,11 +64,11 @@ public class KafkaLowLevelConsumerRoutingTableBuilderTest {
       String[][] segmentNames = new String[partitionCount][];
       int totalSegmentCount = 0;
       for (int partitionId = 0; partitionId < partitionCount; partitionId++) {
-        int segmentCount = random.nextInt(32); // 0 to 31 partitions
+        int segmentCount = random.nextInt(32); // 0 to 31 segments in partition
         segmentNames[partitionId] = new String[segmentCount];
         for (int sequenceNumber = 0; sequenceNumber < segmentCount; sequenceNumber++) {
-          segmentNames[partitionId][sequenceNumber] = SegmentNameBuilder.Realtime.buildLowLevelConsumerSegmentName(
-              "table", Integer.toString(partitionId), Integer.toString(sequenceNumber), System.currentTimeMillis());
+          segmentNames[partitionId][sequenceNumber] = new LLCSegmentName("table", partitionId, sequenceNumber,
+              System.currentTimeMillis()).getSegmentName();
         }
         totalSegmentCount += segmentCount;
       }
@@ -87,31 +89,33 @@ public class KafkaLowLevelConsumerRoutingTableBuilderTest {
         String[] segments = segmentNames[partitionId];
 
         // Assign each segment for this partition
-        for (int segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
-          int instanceIndex = -1;
-          int randomOffset = random.nextInt(instanceCount);
+        for (int replicaId = 0; replicaId < replicationFactor; ++replicaId) {
+          for (int segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+            int instanceIndex = -1;
+            int randomOffset = random.nextInt(instanceCount);
 
-          // Pick the first random instance that has fewer than maxSegmentCountOnInstance segments assigned to it
-          for (int j = 0; j < instanceCount; j++) {
-            int potentialInstanceIndex = (j + randomOffset) % instanceCount;
-            if (segmentCountForInstance[potentialInstanceIndex] < maxSegmentCountOnInstance) {
-              instanceIndex = potentialInstanceIndex;
-              break;
+            // Pick the first random instance that has fewer than maxSegmentCountOnInstance segments assigned to it
+            for (int j = 0; j < instanceCount; j++) {
+              int potentialInstanceIndex = (j + randomOffset) % instanceCount;
+              if (segmentCountForInstance[potentialInstanceIndex] < maxSegmentCountOnInstance) {
+                instanceIndex = potentialInstanceIndex;
+                break;
+              }
             }
+
+            // All replicas have exactly maxSegmentCountOnInstance, pick a replica and increment the max
+            if (instanceIndex == -1) {
+              maxSegmentCountOnInstance++;
+              instanceIndex = randomOffset;
+            }
+
+            // Increment the segment count for the instance
+            segmentCountForInstance[instanceIndex]++;
+
+            // Add the segment to the external view
+            // TODO Add some segments in CONSUMING state
+            externalView.setState(segmentNames[partitionId][segmentIndex], instanceNames[instanceIndex], "ONLINE");
           }
-
-          // All replicas have exactly maxSegmentCountOnInstance, pick a replica and increment the max
-          if (instanceIndex == -1) {
-            maxSegmentCountOnInstance++;
-            instanceIndex = randomOffset;
-          }
-
-          // Increment the segment count for the instance
-          segmentCountForInstance[instanceIndex]++;
-
-          // Add the segment to the external view
-          // TODO Add some segments in CONSUMING state
-          externalView.setState(segmentNames[partitionId][segmentIndex], instanceNames[instanceIndex], "ONLINE");
         }
       }
 

@@ -17,6 +17,8 @@
 package com.linkedin.pinot.routing.builder;
 
 import com.linkedin.pinot.common.utils.CommonConstants;
+import com.linkedin.pinot.common.utils.LLCSegmentName;
+import com.linkedin.pinot.common.utils.SegmentName;
 import com.linkedin.pinot.common.utils.SegmentNameBuilder;
 import com.linkedin.pinot.routing.ServerToSegmentSetMap;
 import java.util.ArrayList;
@@ -100,50 +102,35 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
     //    assigned to each replica.
 
     // 1. Gather all segments and group them by Kafka partition, sorted by sequence number
-    Map<String, SortedSet<String>> sortedSegmentsByKafkaPartition = new HashMap<String, SortedSet<String>>();
+    Map<String, SortedSet<SegmentName>> sortedSegmentsByKafkaPartition = new HashMap<String, SortedSet<SegmentName>>();
     for (String helixPartitionName : externalView.getPartitionSet()) {
       // Ignore segments that are not low level consumer segments
       if (!SegmentNameBuilder.Realtime.isRealtimeV2Name(helixPartitionName)) {
         continue;
       }
 
-      String kafkaPartitionName = SegmentNameBuilder.Realtime.extractPartitionRange(helixPartitionName);
-      SortedSet<String> segmentsForPartition = sortedSegmentsByKafkaPartition.get(kafkaPartitionName);
+      final LLCSegmentName segmentName = new LLCSegmentName(helixPartitionName);
+      String kafkaPartitionName = segmentName.getPartitionRange();
+      SortedSet<SegmentName> segmentsForPartition = sortedSegmentsByKafkaPartition.get(kafkaPartitionName);
 
       // Create sorted set if necessary
       if (segmentsForPartition == null) {
-        segmentsForPartition = new TreeSet<String>(new Comparator<String>() {
-          @Override
-          public int compare(String firstSegment, String secondSegment) {
-            // Sort based on sequence number, falling back on string comparison in case there is an exception
-            try {
-              int firstSegmentSequenceNumber =
-                  Integer.parseInt(SegmentNameBuilder.Realtime.extractSequenceNumber(firstSegment));
-              int secondSegmentSequenceNumber =
-                  Integer.parseInt(SegmentNameBuilder.Realtime.extractSequenceNumber(secondSegment));
-              return Integer.compare(firstSegmentSequenceNumber, secondSegmentSequenceNumber);
-            } catch (NumberFormatException e) {
-              LOGGER.warn("Caught number format exception while comparing segments {} and {}", firstSegment,
-                  secondSegment, e);
-              return firstSegment.compareTo(secondSegment);
-            }
-          }
-        });
+        segmentsForPartition = new TreeSet<SegmentName>();
 
         sortedSegmentsByKafkaPartition.put(kafkaPartitionName, segmentsForPartition);
       }
 
-      segmentsForPartition.add(helixPartitionName);
+      segmentsForPartition.add(segmentName);
     }
 
     // 2. Ensure that for each partition, we have at most one partition in consuming state
-    Map<String, String> lastSegmentInConsumingStateByKafkaPartition = new HashMap<String, String>();
+    Map<String, SegmentName> lastSegmentInConsumingStateByKafkaPartition = new HashMap<String, SegmentName>();
     for (String kafkaPartition : sortedSegmentsByKafkaPartition.keySet()) {
-      SortedSet<String> sortedSegmentsForKafkaPartition = sortedSegmentsByKafkaPartition.get(kafkaPartition);
-      String lastSegment = sortedSegmentsForKafkaPartition.last();
+      SortedSet<SegmentName> sortedSegmentsForKafkaPartition = sortedSegmentsByKafkaPartition.get(kafkaPartition);
+      SegmentName lastSegment = sortedSegmentsForKafkaPartition.last();
 
       // Only keep the segment if all replicas have it in CONSUMING state
-      Map<String, String> helixPartitionState = externalView.getStateMap(lastSegment);
+      Map<String, String> helixPartitionState = externalView.getStateMap(lastSegment.getSegmentName());
       for (String externalViewState : helixPartitionState.values()) {
         // Ignore ERROR state
         if (externalViewState.equalsIgnoreCase(
@@ -176,16 +163,16 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
         });
     RoutingTableInstancePruner instancePruner = new RoutingTableInstancePruner(instanceConfigList);
 
-    for (Map.Entry<String, SortedSet<String>> entry : sortedSegmentsByKafkaPartition.entrySet()) {
+    for (Map.Entry<String, SortedSet<SegmentName>> entry : sortedSegmentsByKafkaPartition.entrySet()) {
       String kafkaPartition = entry.getKey();
-      SortedSet<String> segments = entry.getValue();
+      SortedSet<SegmentName> segmentNames = entry.getValue();
 
       // The only segment name which is allowed to be in CONSUMING state or null
-      String validConsumingSegment = lastSegmentInConsumingStateByKafkaPartition.get(kafkaPartition);
+      SegmentName validConsumingSegment = lastSegmentInConsumingStateByKafkaPartition.get(kafkaPartition);
 
-      for (String segment : segments) {
+      for (SegmentName segmentName : segmentNames) {
         Set<String> validReplicas = new HashSet<String>();
-        Map<String, String> externalViewState = externalView.getStateMap(segment);
+        Map<String, String> externalViewState = externalView.getStateMap(segmentName.getSegmentName());
 
         for (Map.Entry<String, String> instanceAndStateEntry : externalViewState.entrySet()) {
           String instance = instanceAndStateEntry.getKey();
@@ -204,12 +191,13 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
 
           // Replicas in CONSUMING state are only allowed on the last segment
           if (state.equalsIgnoreCase(CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.CONSUMING)
-              && segment.equals(validConsumingSegment)) {
+              && segmentName.equals(validConsumingSegment)) {
             validReplicas.add(instance);
           }
         }
 
-        segmentToReplicaSetQueue.add(new ImmutablePair<String, Set<String>>(segment, validReplicas));
+        segmentToReplicaSetQueue.add(new ImmutablePair<String, Set<String>>(segmentName.getSegmentName(),
+            validReplicas));
       }
     }
 
@@ -267,6 +255,11 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
     int maxSegmentCount = 0;
     for (int i = 0; i < replicas.length; i++) {
       String replica = replicas[i];
+
+      if (!instanceToSegmentSetMap.containsKey(replica)) {
+        instanceToSegmentSetMap.put(replica, new HashSet<String>());
+      }
+
       int replicaSegmentCount = instanceToSegmentSetMap.get(replica).size();
       replicaSegmentCounts[i] = replicaSegmentCount;
 
