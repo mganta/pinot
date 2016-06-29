@@ -124,31 +124,49 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
     }
 
     // 2. Ensure that for each partition, we have at most one partition in consuming state
-    Map<String, SegmentName> lastSegmentInConsumingStateByKafkaPartition = new HashMap<String, SegmentName>();
+    Map<String, SegmentName> allowedSegmentInConsumingStateByKafkaPartition = new HashMap<String, SegmentName>();
     for (String kafkaPartition : sortedSegmentsByKafkaPartition.keySet()) {
       SortedSet<SegmentName> sortedSegmentsForKafkaPartition = sortedSegmentsByKafkaPartition.get(kafkaPartition);
-      SegmentName lastSegment = sortedSegmentsForKafkaPartition.last();
+      SegmentName lastAllowedSegmentInConsumingState = null;
 
-      // Only keep the segment if all replicas have it in CONSUMING state
-      Map<String, String> helixPartitionState = externalView.getStateMap(lastSegment.getSegmentName());
-      for (String externalViewState : helixPartitionState.values()) {
-        // Ignore ERROR state
-        if (externalViewState.equalsIgnoreCase(
-            CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.ERROR)) {
-          continue;
+      for (SegmentName segmentName : sortedSegmentsForKafkaPartition) {
+        Map<String, String> helixPartitionState = externalView.getStateMap(segmentName.getSegmentName());
+        boolean allInConsumingState = true;
+        int replicasInConsumingState = 0;
+
+        // Only keep the segment if all replicas have it in CONSUMING state
+        for (String externalViewState : helixPartitionState.values()) {
+          // Ignore ERROR state
+          if (externalViewState.equalsIgnoreCase(
+              CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.ERROR)) {
+            continue;
+          }
+
+          // Not all segments are in CONSUMING state, therefore don't consider the last segment assignable to CONSUMING
+          // replicas
+          if (externalViewState.equalsIgnoreCase(
+              CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.ONLINE)) {
+            allInConsumingState = false;
+            break;
+          }
+
+          // Otherwise count the replica as being in CONSUMING state
+          if (externalViewState.equalsIgnoreCase(
+              CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.CONSUMING)) {
+            replicasInConsumingState++;
+          }
         }
 
-        // Not all segments are in CONSUMING state, therefore don't consider the last segment assignable to CONSUMING
-        // replicas
-        if (externalViewState.equalsIgnoreCase(
-            CommonConstants.Helix.StateModel.RealtimeSegmentOnlineOfflineStateModel.ONLINE)) {
-          lastSegment = null;
+        // If all replicas have this segment in consuming state (and not all of them are in ERROR state), then pick this
+        // segment to be the last allowed segment to be in CONSUMING state
+        if (allInConsumingState && 0 < replicasInConsumingState) {
+          lastAllowedSegmentInConsumingState = segmentName;
           break;
         }
       }
 
-      if (lastSegment != null) {
-        lastSegmentInConsumingStateByKafkaPartition.put(kafkaPartition, lastSegment);
+      if (lastAllowedSegmentInConsumingState != null) {
+        allowedSegmentInConsumingStateByKafkaPartition.put(kafkaPartition, lastAllowedSegmentInConsumingState);
       }
     }
 
@@ -168,7 +186,7 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
       SortedSet<SegmentName> segmentNames = entry.getValue();
 
       // The only segment name which is allowed to be in CONSUMING state or null
-      SegmentName validConsumingSegment = lastSegmentInConsumingStateByKafkaPartition.get(kafkaPartition);
+      SegmentName validConsumingSegment = allowedSegmentInConsumingStateByKafkaPartition.get(kafkaPartition);
 
       for (SegmentName segmentName : segmentNames) {
         Set<String> validReplicas = new HashSet<String>();
@@ -198,6 +216,12 @@ public class KafkaLowLevelConsumerRoutingTableBuilder implements RoutingTableBui
 
         segmentToReplicaSetQueue.add(new ImmutablePair<String, Set<String>>(segmentName.getSegmentName(),
             validReplicas));
+
+        // If this segment is the segment allowed in CONSUMING state, don't process segments after it in that Kafka
+        // partition
+        if (segmentName.equals(validConsumingSegment)) {
+          break;
+        }
       }
     }
 

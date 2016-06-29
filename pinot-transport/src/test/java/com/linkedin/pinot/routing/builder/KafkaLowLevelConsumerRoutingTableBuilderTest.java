@@ -17,6 +17,7 @@ package com.linkedin.pinot.routing.builder;
 
 import com.linkedin.pinot.common.utils.CommonConstants;
 import com.linkedin.pinot.common.utils.LLCSegmentName;
+import com.linkedin.pinot.common.utils.SegmentName;
 import com.linkedin.pinot.common.utils.SegmentNameBuilder;
 import com.linkedin.pinot.routing.ServerToSegmentSetMap;
 import java.util.ArrayList;
@@ -24,6 +25,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
+import org.apache.helix.ZNRecord;
 import org.apache.helix.model.ExternalView;
 import org.apache.helix.model.InstanceConfig;
 import org.slf4j.Logger;
@@ -113,7 +115,6 @@ public class KafkaLowLevelConsumerRoutingTableBuilderTest {
             segmentCountForInstance[instanceIndex]++;
 
             // Add the segment to the external view
-            // TODO Add some segments in CONSUMING state
             externalView.setState(segmentNames[partitionId][segmentIndex], instanceNames[instanceIndex], "ONLINE");
           }
         }
@@ -142,5 +143,52 @@ public class KafkaLowLevelConsumerRoutingTableBuilderTest {
     }
 
     LOGGER.warn("Routing table building avg ms: " + totalNanos / (ITERATIONS * 1000000.0));
+  }
+
+  @Test
+  public void testMultipleConsumingSegments() {
+    final int SEGMENT_COUNT = 10;
+    final int ONLINE_SEGMENT_COUNT = 8;
+    final int CONSUMING_SEGMENT_COUNT = SEGMENT_COUNT - ONLINE_SEGMENT_COUNT;
+
+    KafkaLowLevelConsumerRoutingTableBuilder routingTableBuilder = new KafkaLowLevelConsumerRoutingTableBuilder();
+    routingTableBuilder.init(null);
+
+    List<SegmentName> segmentNames = new ArrayList<SegmentName>();
+    for(int i = 0; i < SEGMENT_COUNT; ++i) {
+      segmentNames.add(new LLCSegmentName("table", 0, i, System.currentTimeMillis()));
+    }
+
+    List<InstanceConfig> instanceConfigs = new ArrayList<InstanceConfig>();
+    InstanceConfig instanceConfig = new InstanceConfig("Server_localhost_1234");
+    instanceConfigs.add(instanceConfig);
+    instanceConfig.getRecord().setSimpleField(CommonConstants.Helix.IS_SHUTDOWN_IN_PROGRESS, "false");
+
+    // Generate an external view for a single server with some consuming segments
+    ExternalView externalView = new ExternalView("table_REALTIME");
+    for (int i = 0; i < ONLINE_SEGMENT_COUNT; i++) {
+      externalView.setState(segmentNames.get(i).getSegmentName(), "Server_localhost_1234", "ONLINE");
+    }
+    for (int i = ONLINE_SEGMENT_COUNT; i < SEGMENT_COUNT; ++i) {
+      externalView.setState(segmentNames.get(i).getSegmentName(), "Server_localhost_1234", "CONSUMING");
+    }
+
+    List<ServerToSegmentSetMap> routingTables =
+        routingTableBuilder.computeRoutingTableFromExternalView("table", externalView, instanceConfigs);
+
+    for (ServerToSegmentSetMap routingTable : routingTables) {
+      for (String server : routingTable.getServerSet()) {
+        Set<String> segmentSet = routingTable.getSegmentSet(server);
+        assertEquals(segmentSet.size(), ONLINE_SEGMENT_COUNT + 1, "");
+
+        // Should only contain the first consuming segment, not the second
+        assertTrue(segmentSet.contains(segmentNames.get(ONLINE_SEGMENT_COUNT).getSegmentName()),
+            "Segment set does not contain the first segment in consuming state");
+        for (int i = ONLINE_SEGMENT_COUNT + 1; i < SEGMENT_COUNT; i++) {
+          assertFalse(segmentSet.contains(segmentNames.get(i).getSegmentName()),
+              "Segment set contains a segment in consuming state that should not be there");
+        }
+      }
+    }
   }
 }
