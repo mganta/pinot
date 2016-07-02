@@ -135,7 +135,7 @@ function renderD3heatmap(data, tab) {
                 var value = target.attr("id");
 
                 var treemapOffset = $($(".dimension-treemap")[0]).offset();
-                var tooltipWidth = $("#tooltip").css("width") ;
+                var tooltipWidth = $("#tooltip").css("width");
                 var tooltipHeight = $("#tooltip").css("height");
 
                 var tooltipWidthOffset = parseInt(tooltipWidth.substring(0, tooltipWidth.length -2) ) / 2;
